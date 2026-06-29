@@ -9,11 +9,16 @@ from pathlib import Path
 
 DOCKER_EXECUTABLE = os.environ.get("PROGRAMBENCH_DOCKER_EXECUTABLE", "docker")
 DOCKER_CPUS = int(os.environ.get("PROGRAMBENCH_DOCKER_CPUS", "10"))
-DOCKER_RUN_ARGS: list[str] = []
+DOCKER_RUN_ARGS: list[str] = os.environ.get("PROGRAMBENCH_DOCKER_RUN_ARGS", "").split()
 # Timeouts (seconds) for blocking docker subcommands. Pulls + container start
 # can be slow under parallelism, so defaults are generous.
 DOCKER_RUN_TIMEOUT = int(os.environ.get("PROGRAMBENCH_DOCKER_RUN_TIMEOUT", "300"))
 DOCKER_CP_TIMEOUT = int(os.environ.get("PROGRAMBENCH_DOCKER_CP_TIMEOUT", "300"))
+# Wall timeout (seconds) for a single test branch's run.sh. A branch whose
+# suite hangs (interactive/daemon/network tests with no input) is force-killed
+# at this bound; its tests are then recorded as not_run rather than blocking
+# the whole eval. Default matches the original hardcoded value.
+TEST_RUN_TIMEOUT = int(os.environ.get("PROGRAMBENCH_TEST_TIMEOUT", "3600"))
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 TASKS_DIR = PACKAGE_ROOT / "data" / "tasks"

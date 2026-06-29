@@ -9,6 +9,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Any
+import os
 
 from programbench.constants import DOCKER_CP_TIMEOUT, DOCKER_RUN_TIMEOUT
 
@@ -35,6 +36,18 @@ class ContainerEnvironment:
         self.cpus = cpus
         self._name = f"programbench-{uuid.uuid4().hex[:12]}"
         run_args = list(run_args or [])
+        storage_size = os.environ.get("PROGRAMBENCH_DOCKER_STORAGE_SIZE", "50G").strip()
+        has_storage_opt_arg = any(arg == "--storage-opt" or arg.startswith("--storage-opt=") for arg in run_args)
+        memory = os.environ.get("PROGRAMBENCH_DOCKER_MEMORY", "60g").strip()
+        memory_swap = os.environ.get("PROGRAMBENCH_DOCKER_MEMORY_SWAP", memory).strip()
+        has_memory_arg = any(arg in {"--memory", "-m"} or arg.startswith("--memory=") for arg in run_args)
+        has_memory_swap_arg = any(arg == "--memory-swap" or arg.startswith("--memory-swap=") for arg in run_args)
+        if memory and not has_memory_arg:
+            run_args.extend(["--memory", memory])
+        if memory_swap and not has_memory_swap_arg:
+            run_args.extend(["--memory-swap", memory_swap])
+        if storage_size and not has_storage_opt_arg:
+            run_args.extend(["--storage-opt", f"size={storage_size}"])
         env_dict = {"PYTEST_XDIST_AUTO_NUM_WORKERS": str(cpus), **(env or {})}
         env_args: list[str] = []
         for key, value in env_dict.items():
@@ -170,6 +183,13 @@ class ContainerEnvironment:
             cp = subprocess.run(cmd, stdin=stdin_stream, capture_output=True, text=True, timeout=DOCKER_CP_TIMEOUT)
             if cp.returncode != 0:
                 raise RuntimeError(f"tar stream into container failed: {cp.stderr.strip()}")
+
+    def copy_out(self, container_path: str, host_path: Path) -> None:
+        """Copy a file out of the container to the host via ``docker cp``."""
+        cmd = [self.executable, "cp", f"{self.container_id}:{container_path}", str(host_path)]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=DOCKER_CP_TIMEOUT)
+        if result.returncode != 0:
+            raise RuntimeError(f"docker cp out failed: {(result.stdout + result.stderr).strip()}")
 
     def commit(self, image_ref: str) -> str:
         """Commit the current container state to a new image and return its ref."""

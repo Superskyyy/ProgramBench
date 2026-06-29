@@ -20,6 +20,7 @@ Do not remove this notice.
 """
 
 import logging
+import os
 import subprocess
 import tempfile
 import threading
@@ -38,6 +39,7 @@ from programbench.constants import (
     DOCKER_CPUS,
     DOCKER_EXECUTABLE,
     DOCKER_RUN_ARGS,
+    TEST_RUN_TIMEOUT,
     WORKSPACE_DIR,
 )
 from programbench.container import ContainerEnvironment, remove_image
@@ -295,10 +297,14 @@ class Evaluator:
         docker_cpus: int = DOCKER_CPUS,
         branch_workers: int = 1,
         branch_retries: int = 1,
+        reference_mode: bool = False,
+        disable_reruns: bool = False,
     ):
         self.image_name = image_name
         self.solution_branch = solution_branch
         self.submission_archive = submission_archive
+        self.reference_mode = reference_mode
+        self.disable_reruns = disable_reruns
         self.blob_dir = blob_dir
         self.tests_branches = tests_branches
         self.remove_hashes = remove_hashes or []
@@ -308,7 +314,15 @@ class Evaluator:
         self.ignored_branches = ignored_branches or set()
         self.instance_id = instance_id
         self.docker_cpus = docker_cpus
-        self.branch_workers = max(1, branch_workers)
+        # OSB reuse-mode shares ONE sandbox across branches -> must be serial. Recompile-mode
+        # (OSB_FRESH_PER_BRANCH) gives each branch its own fresh sandbox, so branches parallelize
+        # like Docker. Docker always parallelizes.
+        self.backend = os.environ.get("PROGRAMBENCH_BACKEND", "docker")
+        from programbench.osb_container import OSB_FRESH_PER_BRANCH
+        if self.backend == "opensandbox" and not OSB_FRESH_PER_BRANCH:
+            self.branch_workers = 1
+        else:
+            self.branch_workers = max(1, branch_workers)
         self.branch_retries = max(0, branch_retries)
         self._has_rerunfailures = False
         self._log_lock = threading.Lock()
@@ -394,25 +408,24 @@ class Evaluator:
         step_name: str,
         timeout: int = 60,
     ) -> str:
-        """Copy a file out of the container via ``docker cp`` and return its contents.
+        """Copy a file out of the container via ``env.copy_out`` and return its contents.
 
         Bypasses bash so login-shell stderr (``mesg: ttyname failed`` etc.) can't
         pollute the bytes the way ``cat <file>`` would. Logs to ``log_buf`` with
         the same shape as ``_run_step``; on success the entry's ``output`` holds
-        the file contents so ``from_existing`` replay keeps working.
+        the file contents so ``from_existing`` replay keeps working. ``copy_out``
+        is backend-specific (docker cp / sandbox file download).
         """
         host_tmp = Path(tempfile.mkstemp(suffix=Path(container_path).suffix or ".out")[1])
-        cmd_list = [env.executable, "cp", f"{env.container_id}:{container_path}", str(host_tmp)]
-        cmd_str = " ".join(cmd_list)
+        cmd_str = f"copy_out {env.container_id}:{container_path}"
         log.debug("Running step: %s", cmd_str)
         t0 = time.monotonic()
         try:
             try:
-                cp = subprocess.run(cmd_list, capture_output=True, text=True, timeout=timeout)
-                rc = cp.returncode
-                err = (cp.stdout + cp.stderr).strip()
-            except subprocess.TimeoutExpired:
-                rc, err = -1, f"docker cp timed out after {timeout}s"
+                env.copy_out(container_path, host_tmp)
+                rc, err = 0, ""
+            except Exception as e:
+                rc, err = -1, str(e)
             wall_time = time.monotonic() - t0
             if rc != 0:
                 log_buf.append(
@@ -456,6 +469,40 @@ class Evaluator:
         env = {"PYTEST_ADDOPTS": addopts}
         if serial_pytest:
             env["PYTEST_XDIST_AUTO_NUM_WORKERS"] = "1"
+        if self.backend == "opensandbox":
+            from programbench.osb_container import _OSB, OpenSandboxEnvironment, map_image_to_cleanroom
+
+            # Reuse the post-build sandbox registered by commit() for every
+            # branch. Reset /workspace to the post-compile snapshot first so each
+            # branch starts from the same state a fresh Docker branch container
+            # would (no carry-over from the previous branch's test run).
+            from programbench.osb_container import OSB_FRESH_PER_BRANCH
+
+            if image in _OSB:
+                committed = _OSB[image]
+                if OSB_FRESH_PER_BRANCH:
+                    # Recompile per branch in a brand-new sandbox (like Docker, minus the image
+                    # commit): fresh cleanroom sandbox -> wipe -> copy submission -> compile.sh ->
+                    # stash binary. Rebuilds the full env (system deps included) natively each
+                    # branch, so memory never accumulates (no OOM) and no snapshot/registry is
+                    # needed. Not committed -> cleanup() kills it after the branch.
+                    fresh = OpenSandboxEnvironment(
+                        image=map_image_to_cleanroom(image, self.instance_id),
+                        cwd=WORKSPACE_DIR, timeout=600, cpus=self.docker_cpus, env=env,
+                        instance_id=self.instance_id,
+                    )
+                    self._compile_executable(fresh, [])
+                    return fresh
+                committed.reset_workspace()
+                return committed
+            return OpenSandboxEnvironment(
+                image=map_image_to_cleanroom(image, self.instance_id),
+                cwd=WORKSPACE_DIR,
+                timeout=600,
+                cpus=self.docker_cpus,
+                env=env,
+                instance_id=self.instance_id,
+            )
         return ContainerEnvironment(
             image=image,
             cwd=WORKSPACE_DIR,
@@ -557,11 +604,61 @@ class Evaluator:
         )
         self._has_rerunfailures = rerun_install["returncode"] == 0
 
+    def _prepare_reference(self, env: ContainerEnvironment, log_buf: list[dict]) -> None:
+        """Reference-binary mode: grade the image's own pre-built reference
+        binary instead of compiling a submission.
+
+        The :task_cleanroom image ships the reference binary at
+        ``/workspace/executable`` (execute-only, root-owned). We skip the
+        wipe/extract/compile.sh steps entirely and just stash + hash that
+        binary so the downstream commit and per-branch ``_restore_executable``
+        path is byte-for-byte identical to the normal compile flow. The
+        container runs as root, so the execute-only binary is readable.
+        """
+        self._run_step(
+            f"test -x {WORKSPACE_DIR}/executable",
+            env=env,
+            log_buf=log_buf,
+            step_name="check_reference_executable",
+            timeout=60,
+        )
+        self._run_step(
+            f"cp {WORKSPACE_DIR}/executable {self._stashed_executable}",
+            env=env,
+            log_buf=log_buf,
+            step_name="copy_executable",
+            timeout=300,
+        )
+        r = self._run_step(
+            f"sha256sum {self._stashed_executable}",
+            env=env,
+            log_buf=log_buf,
+            step_name="hash_executable",
+            timeout=300,
+        )
+        self.result.executable_hash = r["output"].split()[0]
+        if self.disable_reruns:
+            return
+        rerun_install = self._run_step(
+            "pip3 install -q --disable-pip-version-check pytest-rerunfailures",
+            env=env,
+            log_buf=log_buf,
+            step_name="install_rerunfailures",
+            accept_failure=True,
+            timeout=120,
+        )
+        self._has_rerunfailures = rerun_install["returncode"] == 0
+
     def _restore_executable(self, env: ContainerEnvironment, log_buf: list[dict]) -> None:
         if self.result.executable_hash is None:
             raise EvalStepError("no_executable_hash", "Executable hash not found")
+        # Use cp (not mv) so the canonical stashed binary survives for the next
+        # branch. The Docker backend runs each branch in a fresh container off
+        # the committed image (stash always present), so cp vs mv is a no-op
+        # there; the OpenSandbox backend reuses ONE sandbox across all branches,
+        # where mv would consume the stash after the first branch.
         self._run_step(
-            f"rm -f ./executable && mv {self._stashed_executable} ./executable && chmod +x ./executable",
+            f"rm -f ./executable && cp {self._stashed_executable} ./executable && chmod +x ./executable",
             env=env,
             log_buf=log_buf,
             step_name="restore_executable",
@@ -649,7 +746,7 @@ class Evaluator:
                 log_buf=log_buf,
                 step_name="run_tests",
                 accept_failure=True,
-                timeout=3600,
+                timeout=TEST_RUN_TIMEOUT,
             )
             xml = self._copy_file_from_container(
                 env=env,
@@ -797,7 +894,10 @@ class Evaluator:
             if self._from_existing is None:
                 compile_env = self._new_env(f"{self.image_name}:{self.image_tag}")
                 try:
-                    self._compile_executable(compile_env, self.result.log)
+                    if self.reference_mode:
+                        self._prepare_reference(compile_env, self.result.log)
+                    else:
+                        self._compile_executable(compile_env, self.result.log)
                 except EvalStepError as e:
                     self.result.error_code = e.error_code
                     self.result.error_details = e.error_details
@@ -839,7 +939,12 @@ class Evaluator:
             if compile_env is not None:
                 compile_env.cleanup()
             if committed_image is not None:
-                remove_image(committed_image, executable=DOCKER_EXECUTABLE)
+                if self.backend == "opensandbox":
+                    from programbench.osb_container import remove_image as osb_remove_image
+
+                    osb_remove_image(committed_image)
+                else:
+                    remove_image(committed_image, executable=DOCKER_EXECUTABLE)
 
 
 def parse_test_results(results_xml: str, branch: str = "") -> EvaluationResult:
