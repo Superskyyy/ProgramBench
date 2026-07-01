@@ -619,7 +619,14 @@ class Evaluator:
             # with the canonical hash.
             assert self.blob_dir is not None
             test_tar = self.blob_dir / "tests" / f"{branch}.tar.gz"
-            env.copy_in_tar(test_tar, f"{WORKSPACE_DIR}/")
+            try:
+                env.copy_in_tar(test_tar, f"{WORKSPACE_DIR}/")
+            except RuntimeError as e:
+                # A branch-setup failure (e.g. a submission dir colliding with a test-tar
+                # symlink, tar "File exists") must be recorded as a FAILED branch (0 resolved)
+                # and banked, not crash the whole instance. Route it through the EvalStepError
+                # path so _add_branch_error + _inject_not_run mark this branch's tests 0.
+                raise EvalStepError("branch_setup_failed", str(e))
             self._restore_executable(env, log_buf)
             self._run_step(
                 "rm -f eval/results.xml results.xml",
