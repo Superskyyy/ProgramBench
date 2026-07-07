@@ -490,7 +490,13 @@ class Evaluator:
             timeout=300,
         )
         assert self.submission_archive is not None
-        env.copy_in_tar(self.submission_archive, f"{WORKSPACE_DIR}/")
+        try:
+            env.copy_in_tar(self.submission_archive, f"{WORKSPACE_DIR}/")
+        except RuntimeError as e:
+            # A corrupt/pathological submission archive is a submission failure,
+            # not a reason to leave the instance without an eval.json. Route it
+            # through the compile-failure path so all tests are banked as 0.
+            raise EvalStepError("submission_import_failed", str(e))
         self._remove_hashed_files(env, log_buf)
         # Seed a synthetic git repo if the submission didn't ship one. Build
         # scripts that depend on a working tree (jq submodules, calcurse's
